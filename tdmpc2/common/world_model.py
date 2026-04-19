@@ -103,8 +103,33 @@ class WorldModel(nn.Module):
 	def encode(self, obs, task):
 		"""
 		Encodes an observation into its latent representation.
-		This implementation assumes a single state-based observation.
+		Supports single-tensor obs (state OR rgb) as well as multi-modal
+		dict/TensorDict obs (keys 'state' and 'rgb'), with optional time
+		leading dim handled by iterating.
 		"""
+		# Multi-modal dict / TensorDict obs
+		if not isinstance(obs, torch.Tensor) and hasattr(obs, 'keys'):
+			if 'fusion' in self._encoder:
+				state = obs['state']
+				rgb = obs['rgb']
+				if rgb.ndim == 5:
+					T = rgb.shape[0]
+					outs = []
+					for t in range(T):
+						s_feat = self._encoder['state'](state[t])
+						r_feat = self._encoder['rgb'](rgb[t])
+						outs.append(self._encoder['fusion'](torch.cat([s_feat, r_feat], dim=-1)))
+					return torch.stack(outs)
+				s_feat = self._encoder['state'](state)
+				r_feat = self._encoder['rgb'](rgb)
+				return self._encoder['fusion'](torch.cat([s_feat, r_feat], dim=-1))
+			# Single-key dict fallback
+			k = next(iter(obs.keys()))
+			v = obs[k]
+			if k == 'rgb' and v.ndim == 5:
+				return torch.stack([self._encoder[k](o) for o in v])
+			return self._encoder[k](v)
+
 		if self.cfg.multitask:
 			obs = self.task_emb(obs, task)
 		if self.cfg.obs == 'rgb' and obs.ndim == 5:

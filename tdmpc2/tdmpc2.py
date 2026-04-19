@@ -109,7 +109,13 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			torch.Tensor: Action to take in the environment.
 		"""
-		obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
+		if isinstance(obs, dict):
+			obs = {k: v.to(self.device, non_blocking=True).unsqueeze(0) for k, v in obs.items()}
+		elif hasattr(obs, 'keys') and not isinstance(obs, torch.Tensor):
+			# TensorDict
+			obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
+		else:
+			obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
 		if task is not None:
 			task = torch.tensor([task], device=self.device)
 		if self.cfg.mpc:

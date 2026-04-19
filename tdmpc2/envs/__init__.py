@@ -22,6 +22,10 @@ try:
 except:
 	make_metaworld_env = missing_dependencies
 try:
+	from envs.metaworld_custom import make_env as make_metaworld_custom_env
+except:
+	make_metaworld_custom_env = missing_dependencies
+try:
 	from envs.myosuite import make_env as make_myosuite_env
 except:
 	make_myosuite_env = missing_dependencies
@@ -65,7 +69,7 @@ def make_env(cfg):
 
 	else:
 		env = None
-		for fn in [make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env]:
+		for fn in [make_metaworld_custom_env, make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env]:
 			try:
 				env = fn(cfg)
 			except ValueError:

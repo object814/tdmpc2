@@ -54,7 +54,14 @@ class OnlineTrainer(Trainer):
 	def to_td(self, obs, action=None, reward=None, terminated=None):
 		"""Creates a TensorDict for a new episode."""
 		if isinstance(obs, dict):
-			obs = TensorDict(obs, batch_size=(), device='cpu')
+			obs = TensorDict(
+				{k: v.unsqueeze(0).cpu() for k, v in obs.items()},
+				batch_size=(1,),
+				device='cpu',
+			)
+		elif hasattr(obs, 'keys') and not isinstance(obs, torch.Tensor):
+			# Already a TensorDict
+			obs = obs.unsqueeze(0).cpu() if obs.batch_size == () else obs.cpu()
 		else:
 			obs = obs.unsqueeze(0).cpu()
 		if action is None:

@@ -6,6 +6,14 @@ task: dog-run
 obs: state
 episodic: false
 
+# metaworld (custom) — only used when task starts with `mw-`
+image_size: 128
+cameras: [topview, front, gripperPOV]
+max_episode_steps: 250
+action_repeat: 2
+cnn_kernel_size: 4
+cnn_minres: 4
+
 # evaluation
 checkpoint: ???
 eval_episodes: 10

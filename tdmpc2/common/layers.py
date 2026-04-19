@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -150,17 +151,84 @@ def conv(in_shape, num_channels, act=None):
 	return nn.Sequential(*layers)
 
 
+def conv_deep(in_shape, num_channels, latent_dim, kernel_size=4, minres=4, act=None):
+	"""
+	DreamerV3-style convolutional encoder for larger images.
+	Halves spatial dim per layer until it hits `minres`, doubling channels
+	(capped at 8x base) along the way, then projects the flattened feature
+	to `latent_dim` via a LayerNorm'd linear. Used for 128x128 RGB inputs
+	and/or multi-modal observations where the latent must match a fixed
+	`latent_dim` regardless of CNN output size.
+	"""
+	c, h, w = in_shape
+	assert h == w, "conv_deep assumes square RGB inputs"
+	assert h >= minres and (h // minres) > 0
+	num_layers = int(math.log2(h // minres))
+	assert 2 ** num_layers == (h // minres), \
+		f"spatial {h} must downsample to minres={minres} by stride-2 convs"
+	pad = max((kernel_size - 2) // 2, 0)
+	layers_ = [ShiftAug(), PixelPreprocess()]
+	in_c, out_c = c, num_channels
+	for _ in range(num_layers):
+		layers_.append(nn.Conv2d(in_c, out_c, kernel_size, stride=2, padding=pad))
+		layers_.append(nn.GroupNorm(1, out_c))
+		layers_.append(nn.SiLU(inplace=False))
+		in_c = out_c
+		out_c = min(out_c * 2, num_channels * 8)
+	layers_.append(nn.Flatten())
+	flat_dim = in_c * minres * minres
+	layers_.append(nn.Linear(flat_dim, latent_dim))
+	layers_.append(nn.LayerNorm(latent_dim))
+	if act is not None:
+		layers_.append(act)
+	return nn.Sequential(*layers_)
+
+
 def enc(cfg, out={}):
 	"""
 	Returns a dictionary of encoders for each observation in the dict.
+	If the observation is multi-modal (contains both 'state' and 'rgb'),
+	adds a 'fusion' branch that concatenates per-modality features and
+	projects to cfg.latent_dim with SimNorm.
 	"""
-	for k in cfg.obs_shape.keys():
+	keys = list(cfg.obs_shape.keys())
+	multimodal = ('state' in keys and 'rgb' in keys)
+	kernel_size = int(getattr(cfg, 'cnn_kernel_size', 4))
+	minres = int(getattr(cfg, 'cnn_minres', 4))
+
+	for k in keys:
 		if k == 'state':
-			out[k] = mlp(cfg.obs_shape[k][0] + cfg.task_dim, max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg))
+			in_dim = cfg.obs_shape[k][0] + cfg.task_dim
+			if multimodal:
+				out[k] = mlp(in_dim, max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.enc_dim)
+			else:
+				out[k] = mlp(in_dim, max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg))
 		elif k == 'rgb':
-			out[k] = conv(cfg.obs_shape[k], cfg.num_channels, act=SimNorm(cfg))
+			c_shape = cfg.obs_shape[k]
+			h = c_shape[-1]
+			use_deep = multimodal or (h != 64)
+			if multimodal:
+				branch_act = None
+				target_dim = cfg.enc_dim
+			else:
+				branch_act = SimNorm(cfg)
+				target_dim = cfg.latent_dim
+			if use_deep:
+				out[k] = conv_deep(
+					c_shape,
+					num_channels=cfg.num_channels,
+					latent_dim=target_dim,
+					kernel_size=kernel_size,
+					minres=minres,
+					act=branch_act,
+				)
+			else:
+				out[k] = conv(c_shape, cfg.num_channels, act=branch_act)
 		else:
 			raise NotImplementedError(f"Encoder for observation type {k} not implemented.")
+
+	if multimodal:
+		out['fusion'] = NormedLinear(2 * cfg.enc_dim, cfg.latent_dim, act=SimNorm(cfg))
 	return nn.ModuleDict(out)
 
 
