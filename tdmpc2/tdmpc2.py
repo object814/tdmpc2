@@ -352,4 +352,12 @@ class TDMPC2(torch.nn.Module):
 		if task is not None:
 			kwargs["task"] = task
 		torch.compiler.cudagraph_mark_step_begin()
-		return self._update(obs, action, reward, terminated, **kwargs)
+		info = self._update(obs, action, reward, terminated, **kwargs)
+		# torch.compile(mode="reduce-overhead") uses CUDA Graphs, which place
+		# the compiled function's outputs in a STATIC buffer that gets reused
+		# on the next call (after cudagraph_mark_step_begin). Callers like the
+		# trainer hold references to these tensors across many subsequent
+		# `update()` calls (logging at episode boundaries), so without an
+		# explicit clone we'd be reading garbage from a recycled buffer.
+		# `info.clone()` recursively copies every entry into fresh storage.
+		return info.clone()

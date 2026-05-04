@@ -11,10 +11,10 @@ RUN_NAME="mw_tdmpc2_single_drawer_$(date +%m%d)"
 LOGDIR="../logdir/single_tdmpc2/${RUN_NAME}"
 
 # Metaworld task (mw-<env-name> -v3)
-TASK="mw-drawer-open-v3"
+TASK="metaworld_drawer-open-v3"
 
 # Training budget (env steps)
-STEPS=1000
+STEPS=200000
 
 # Seed
 SEED=1
@@ -33,6 +33,7 @@ MPC=true
 MODEL_SIZE=5
 EVAL_FREQ=10000
 EVAL_EPISODES=5
+SAVE_FREQ=50000   # env-step interval for periodic agent checkpoints (0 disables)
 
 # -------- Launch --------
 echo "=================================================="
@@ -46,12 +47,19 @@ echo "=================================================="
 
 mkdir -p "${LOGDIR}"
 
+# Redirect wandb's cache/staging/config away from HOME (quota-limited).
+export WANDB_CACHE_DIR=/Metaworld/.wandb_cache
+export WANDB_DATA_DIR=/Metaworld/.wandb_data
+export WANDB_CONFIG_DIR=/Metaworld/.wandb_config
+mkdir -p "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR" "$WANDB_CONFIG_DIR"
+
 cd "$(dirname "$0")/../tdmpc2"
 
 python train.py \
     task=${TASK} \
     seed=${SEED} \
     steps=${STEPS} \
+    episodic=true \
     model_size=${MODEL_SIZE} \
     batch_size=${BATCH_SIZE} \
     buffer_size=${BUFFER_SIZE} \
@@ -59,6 +67,8 @@ python train.py \
     mpc=${MPC} \
     eval_freq=${EVAL_FREQ} \
     eval_episodes=${EVAL_EPISODES} \
+    save_freq=${SAVE_FREQ} \
+    work_dir=${LOGDIR} \
     image_size=${IMAGE_SIZE} \
     max_episode_steps=${MAX_EPISODE_STEPS} \
     action_repeat=${ACTION_REPEAT} \
@@ -66,5 +76,6 @@ python train.py \
     exp_name=${RUN_NAME} \
     wandb_entity=${WANDB_ENTITY} \
     wandb_project=${WANDB_PROJECT} \
+    wandb_run_name=${RUN_NAME} \
     enable_wandb=true \
     hydra.run.dir=${LOGDIR}

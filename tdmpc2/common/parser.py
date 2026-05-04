@@ -54,7 +54,13 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 			pass
 
 	# Convenience
-	cfg.work_dir = Path(hydra.utils.get_original_cwd()) / 'logs' / cfg.task / str(cfg.seed) / cfg.exp_name
+	if OmegaConf.is_missing(cfg, "work_dir"):
+		cfg.work_dir = Path(hydra.utils.get_original_cwd()) / 'logs' / cfg.task / str(cfg.seed) / cfg.exp_name
+	else:
+		wd = Path(cfg.work_dir)
+		if not wd.is_absolute():
+			wd = Path(hydra.utils.get_original_cwd()) / wd
+		cfg.work_dir = wd
 	cfg.task_title = cfg.task.replace("-", " ").title()
 	cfg.bin_size = (cfg.vmax - cfg.vmin) / (cfg.num_bins-1) # Bin size for discrete regression
 

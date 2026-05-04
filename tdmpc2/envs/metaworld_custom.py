@@ -7,20 +7,20 @@ Mirrors the DreamerV3 `make_env` pipeline in
   gymnasium.make("Meta-World/MT1", env_name=task)
     -> ProprioMultiImageObsWrapper (topview + front + gripperPOV stacked, 128x128)
     -> RewardTuningWrapperV2 ((-1,1) -> (-1,0))
-    -> Gymnasium2Gym (classic gym API for TD-MPC2 compatibility)
+        -> _Gymnasium5To4 (classic gym-style 4-tuple API for TD-MPC2 compatibility)
     -> _DictObsAdapter (rename keys to 'state'/'rgb', CHW layout)
     -> ActionRepeat (k=2, sum rewards; TD-MPC2 default behaviour)
     -> Timeout (configurable max_episode_steps)
 
-Task naming: `mw-<env_name>` e.g. `mw-drawer-open-v3`.
+Task naming: either `metaworld_<env_name>` (DreamerV3 style, preferred) or
+`mw-<env_name>`. Example: `metaworld_drawer-open-v3` or `mw-drawer-open-v3`.
 """
 
-import os
 import sys
 from pathlib import Path
 
-import gym as classic_gym
 import gymnasium
+import gymnasium as classic_gym  # TD-MPC2's Timeout/TensorWrapper also subclass gymnasium.Wrapper
 import numpy as np
 
 from envs.wrappers.timeout import Timeout
@@ -35,19 +35,45 @@ if str(_BASE_DIR) not in sys.path:
 import metaworld  # noqa: F401  # registers the "Meta-World/MT1" entry
 from metaworld.wrappers import ProprioMultiImageObsWrapper
 
-# Reuse the DreamerV3 reward + gym-compat wrappers so both baselines see the
-# exact same environment semantics.
-_DREAMER_DIR = _BASE_DIR / "third_party" / "dreamerv3"
-if str(_DREAMER_DIR) not in sys.path:
-    sys.path.insert(0, str(_DREAMER_DIR))
-
-from envs.metaworld_wrappers import RewardTuningWrapperV2, Gymnasium2Gym  # noqa: E402
 
 
 DEFAULT_CAMERAS = ("topview", "front", "gripperPOV")
 DEFAULT_IMAGE_SIZE = 128
 DEFAULT_MAX_EPISODE_STEPS = 250
 DEFAULT_ACTION_REPEAT = 2
+
+
+class RewardTuningWrapperV2(gymnasium.Wrapper):
+    """Scale rewards from [-1, 1] into [-1, 0] to match DreamerV3 setup."""
+
+    def __init__(
+        self,
+        env: gymnasium.Env,
+        original_reward_range: tuple = (-1.0, 1.0),
+        target_reward_range: tuple = (-1.0, 0.0),
+    ):
+        super().__init__(env)
+        self.orig_min, self.orig_max = original_reward_range
+        self.target_min, self.target_max = target_reward_range
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        normed = (reward - self.orig_min) / (self.orig_max - self.orig_min)
+        scaled = self.target_min + normed * (self.target_max - self.target_min)
+        return obs, scaled, terminated, truncated, info
+
+
+class _Gymnasium5To4(classic_gym.Wrapper):
+    """Convert Gymnasium's (obs, reward, terminated, truncated, info) to 4-tuple."""
+
+    def reset(self, **kwargs):
+        obs, _info = self.env.reset(**kwargs)
+        return obs
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        done = bool(terminated or truncated)
+        return obs, reward, done, info
 
 
 class _DictObsAdapter(classic_gym.Wrapper):
@@ -103,7 +129,7 @@ class _DictObsAdapter(classic_gym.Wrapper):
 
 class _AnnotateTerminated(gymnasium.Wrapper):
     """Preserve the distinction between terminated and truncated in `info`
-    before the subsequent Gymnasium2Gym wrapper collapses them into `done`."""
+    before the subsequent _Gymnasium5To4 wrapper collapses them into `done`."""
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
@@ -131,22 +157,26 @@ class _MetaworldInfoShim(classic_gym.Wrapper):
         return obs, reward, done, info
 
 
+_TASK_PREFIXES = ("metaworld_", "mw-")
+
+
+def _is_metaworld_task(task: str) -> bool:
+    return isinstance(task, str) and any(task.startswith(p) for p in _TASK_PREFIXES)
+
+
 def _strip_task_prefix(task: str) -> str:
-    if not task.startswith("mw-"):
-        raise ValueError(f"Expected task to start with 'mw-', got: {task}")
-    env_name = task[len("mw-"):]
-    if not env_name.endswith("-v3"):
-        # DreamerV3 registry uses v3 entries via "Meta-World/MT1".
-        raise ValueError(
-            f"Metaworld task '{task}' must target a v3 env (e.g. 'mw-drawer-open-v3')."
-        )
-    return env_name
+    for p in _TASK_PREFIXES:
+        if task.startswith(p):
+            return task[len(p):]
+    raise ValueError(
+        f"Expected task to start with one of {_TASK_PREFIXES}, got: {task}"
+    )
 
 
 def make_env(cfg):
     """Make the DreamerV3-aligned Metaworld environment for TD-MPC2."""
     task = cfg.task
-    if not (isinstance(task, str) and task.startswith("mw-")):
+    if not _is_metaworld_task(task):
         raise ValueError("Unknown task:", task)
     env_name = _strip_task_prefix(task)
 
@@ -181,11 +211,10 @@ def make_env(cfg):
         target_reward_range=(-1.0, 0.0),
     )
     env = _AnnotateTerminated(env)
-    env = Gymnasium2Gym(env)
+    env = _Gymnasium5To4(env)
     env = _DictObsAdapter(env)
     env = _MetaworldInfoShim(env)
     if action_repeat > 1:
         env = ActionRepeat(env, repeat=action_repeat)
     env = Timeout(env, max_episode_steps=max_episode_steps)
-    env.max_episode_steps = env._max_episode_steps
     return env

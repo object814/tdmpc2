@@ -12,6 +12,11 @@ class TensorWrapper(gym.Wrapper):
 
 	def __init__(self, env):
 		super().__init__(env)
+
+	@property
+	def max_episode_steps(self):
+		"""Expose episode length metadata expected by TD-MPC2 config parsing."""
+		return getattr(self.env, 'max_episode_steps')
 	
 	def rand_act(self):
 		return torch.from_numpy(self.action_space.sample().astype(np.float32))

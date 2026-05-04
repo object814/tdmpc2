@@ -3,7 +3,17 @@ os.environ['MUJOCO_GL'] = os.getenv("MUJOCO_GL", 'egl')
 os.environ['LAZY_LEGACY_OP'] = '0'
 os.environ['TORCHDYNAMO_INLINE_INBUILT_NN_MODULES'] = "1"
 os.environ['TORCH_LOGS'] = "+recompiles"
+
+os.environ["MUJOCO_GL"] = "osmesa"
+os.environ["XDG_RUNTIME_DIR"] = "/tmp"
+os.environ["EGL_LOG_LEVEL"] = "fatal"
 import warnings
+warnings.filterwarnings("ignore", message="Constant.*may be too high")
+warnings.filterwarnings("ignore", message=".*Please upgrade to Gymnasium.*")
+warnings.filterwarnings("ignore", message=".*Gym has been unmaintained.*")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*torch.cuda.amp.autocast.*")
+# import warnings
 warnings.filterwarnings('ignore')
 import torch
 
@@ -57,6 +67,10 @@ def train(cfg: dict):
 		buffer=Buffer(cfg),
 		logger=Logger(cfg),
 	)
+	# Auto-resume model + manifest + on-disk episode replay if a previous
+	# launch left state under cfg.work_dir. No-op when nothing's there.
+	if not cfg.multitask and hasattr(trainer, 'resume_from'):
+		trainer.resume_from(cfg.work_dir)
 	trainer.train()
 	print('\nTraining completed successfully')
 

@@ -38,6 +38,17 @@ except:
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 
+def _set_env_logger_level(level: int = 40):
+	"""Silence Gym/Gymnasium logs across either logger API shape."""
+	logger = getattr(gym, 'logger', None)
+	if logger is None:
+		return
+	if hasattr(logger, 'set_level'):
+		logger.set_level(level)
+	elif hasattr(logger, 'min_level'):
+		logger.min_level = level
+
+
 def make_multitask_env(cfg):
 	"""
 	Make a multi-task environment for TD-MPC2 experiments.
@@ -63,7 +74,7 @@ def make_env(cfg):
 	"""
 	Make an environment for TD-MPC2 experiments.
 	"""
-	gym.logger.set_level(40)
+	_set_env_logger_level(40)
 	if cfg.multitask:
 		env = make_multitask_env(cfg)
 

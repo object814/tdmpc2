@@ -5,6 +5,7 @@ import re
 
 import numpy as np
 import pandas as pd
+import torch
 from termcolor import colored
 
 from common import TASK_SET
@@ -106,6 +107,16 @@ class VideoRecorder:
 class Logger:
 	"""Primary logging object. Logs either locally or using wandb."""
 
+	def _to_scalar(self, value):
+		"""Convert logged values to JSON-safe Python scalars."""
+		if isinstance(value, torch.Tensor):
+			if value.numel() == 1:
+				return value.detach().cpu().item()
+			return value.detach().cpu().mean().item()
+		if isinstance(value, np.generic):
+			return value.item()
+		return value
+
 	def __init__(self, cfg):
 		self._log_dir = make_dir(cfg.work_dir)
 		self._model_dir = make_dir(self._log_dir / "models")
@@ -117,6 +128,7 @@ class Logger:
 		print_run(cfg)
 		self.project = cfg.get("wandb_project", "none")
 		self.entity = cfg.get("wandb_entity", "none")
+		self.wandb_run_name = cfg.get("wandb_run_name", f"{cfg.task}-seed{cfg.seed}")
 		if not cfg.enable_wandb or self.project == "none" or self.entity == "none":
 			print(colored("Wandb disabled.", "blue", attrs=["bold"]))
 			cfg.save_agent = False
@@ -127,15 +139,27 @@ class Logger:
 		os.environ["WANDB_SILENT"] = "true" if cfg.wandb_silent else "false"
 		import wandb
 
-		wandb.init(
+		# Optional sweep-harness overrides. cfg.get(..., None) tolerates missing
+		# keys for backward compat with hand-written scripts.
+		pinned_id = cfg.get("wandb_run_id", None)
+		group_override = cfg.get("wandb_group", None)
+		tags_override = cfg.get("wandb_tags", None)
+
+		init_kwargs = dict(
 			project=self.project,
 			entity=self.entity,
-			name=str(cfg.seed),
-			group=self._group,
-			tags=cfg_to_group(cfg, return_list=True) + [f"seed:{cfg.seed}"],
+			name=self.wandb_run_name,
+			group=group_override or self._group,
+			tags=list(tags_override) if tags_override else (cfg_to_group(cfg, return_list=True) + [f"seed:{cfg.seed}"]),
 			dir=self._log_dir,
 			config=dataclasses.asdict(cfg),
 		)
+		if pinned_id:
+			init_kwargs["id"] = pinned_id
+			# `allow` covers first launch (creates run with our id) and resume
+			# (re-attaches). `must` would reject the first-launch case.
+			init_kwargs["resume"] = "allow"
+		wandb.init(**init_kwargs)
 		print(colored("Logs will be synced with wandb.", "blue", attrs=["bold"]))
 		self._wandb = wandb
 		self._video = (
@@ -181,7 +205,7 @@ class Logger:
 			value = str(datetime.timedelta(seconds=int(value)))
 			return f'{colored(key+":", "blue")} {value}'
 		else:
-			raise f"invalid log format type: {ty}"
+			raise ValueError(f"invalid log format type: {ty}")
 
 	def _print(self, d, category):
 		category = colored(category, CAT_TO_COLOR[category])
@@ -230,8 +254,8 @@ class Logger:
 				xkey = "iteration"
 			_d = dict()
 			for k, v in d.items():
-				_d[category + "/" + k] = v
-			self._wandb.log(_d, step=d[xkey])
+				_d[category + "/" + k] = self._to_scalar(v)
+			self._wandb.log(_d, step=self._to_scalar(d[xkey]))
 		if category == "eval" and self._save_csv:
 			keys = ["step", "episode_reward"]
 			self._eval.append(np.array([d[keys[0]], d[keys[1]]]))

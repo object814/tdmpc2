@@ -1,3 +1,8 @@
+import os
+import re
+import uuid
+from pathlib import Path
+
 import torch
 from tensordict.tensordict import TensorDict
 from torchrl.data.replay_buffers import ReplayBuffer, LazyTensorStorage
@@ -58,9 +63,19 @@ class Buffer():
 		]) / len(tds)
 		total_bytes = bytes_per_step*self._capacity
 		print(f'Storage required: {total_bytes/1e9:.2f} GB')
-		# Heuristic: decide whether to use CUDA or CPU memory
-		storage_device = 'cuda:0' if 2.5*total_bytes < mem_free else 'cpu'
-		print(f'Using {storage_device.upper()} memory for storage.')
+		# `cfg.buffer_storage_device` overrides the auto-heuristic. Useful when
+		# you want to force GPU regardless of free-memory estimates (and accept
+		# an OOM rather than silent fallback to CPU on a slow re-launch).
+		desired = str(self.cfg.get('buffer_storage_device', 'auto') or 'auto').lower()
+		if desired in ('cuda', 'cuda:0', 'gpu'):
+			storage_device = 'cuda:0'
+			print(f'Using CUDA memory for storage (forced via buffer_storage_device={desired!r}).')
+		elif desired == 'cpu':
+			storage_device = 'cpu'
+			print(f'Using CPU memory for storage (forced via buffer_storage_device={desired!r}).')
+		else:
+			storage_device = 'cuda:0' if 2.5*total_bytes < mem_free else 'cpu'
+			print(f'Using {storage_device.upper()} memory for storage (auto).')
 		self._storage_device = torch.device(storage_device)
 		return self._reserve_buffer(
 			LazyTensorStorage(self._capacity, device=self._storage_device)
@@ -113,3 +128,154 @@ class Buffer():
 		"""Sample a batch of subsequences from the buffer."""
 		td = self._buffer.sample().view(-1, self.cfg.horizon+1).permute(1, 0)
 		return self._prepare_batch(td)
+
+	# ------------------------------------------------------------------
+	#  On-disk episode persistence (mirrors STORM's train_eps/ scheme).
+	#
+	#  File layout:
+	#    {episode_dir}/{episode_idx:09d}_{length}_{uuid}.pt
+	#
+	#  - episode_idx prefix lets us load in chronological order with a sort.
+	#  - length is encoded so prune_episode_dir_to_cap can compute total
+	#    transitions without opening every file.
+	#  - uuid keeps filenames unique even on rapid same-step writes.
+	# ------------------------------------------------------------------
+	_EP_FILENAME_RE = re.compile(r'^(\d{9})_(\d+)_[0-9a-f]{12}\.pt$')
+
+	@staticmethod
+	def _episode_filename(episode_idx, length):
+		uid = uuid.uuid4().hex[:12]
+		return f'{int(episode_idx):09d}_{int(length)}_{uid}.pt'
+
+	@staticmethod
+	def _parse_episode_filename(name):
+		m = Buffer._EP_FILENAME_RE.match(name)
+		if not m:
+			return None
+		return int(m.group(1)), int(m.group(2))   # (ep_idx, length)
+
+	@staticmethod
+	def save_episode(td, episode_dir, episode_idx):
+		"""Write one completed episode to ``episode_dir/{idx}_{len}_{uuid}.pt``.
+
+		Atomic via tmp-file + rename so partial writes never get loaded back.
+		``td`` should be a 1-D TensorDict on CPU (the trainer constructs CPU
+		TensorDicts already; calling .cpu() here is cheap if not).
+		"""
+		episode_dir = Path(episode_dir)
+		episode_dir.mkdir(parents=True, exist_ok=True)
+		length = int(td.batch_size[0]) if td.batch_size else int(td['reward'].shape[0])
+		fname = Buffer._episode_filename(episode_idx, length)
+		path = episode_dir / fname
+		tmp = episode_dir / (fname + '.tmp')
+		torch.save(td.cpu(), tmp)
+		os.replace(tmp, path)
+		return path
+
+	def load_from_directory(self, episode_dir, max_total_steps=None):
+		"""Reload episodes from ``episode_dir`` back into the buffer.
+
+		Newest episodes win when total transitions would exceed
+		``max_total_steps`` — matches STORM's "keep most-recent N transitions"
+		semantic. Returns a stats dict with keys ``transitions_restored``,
+		``episodes_restored``, and ``kept_files`` (the filenames kept).
+		"""
+		episode_dir = Path(episode_dir)
+		if not episode_dir.is_dir():
+			return {'transitions_restored': 0, 'episodes_restored': 0, 'kept_files': set()}
+		entries = []
+		for fname in os.listdir(episode_dir):
+			parsed = self._parse_episode_filename(fname)
+			if parsed is None:
+				continue
+			ep_idx, length = parsed
+			entries.append((ep_idx, length, fname))
+		if not entries:
+			return {'transitions_restored': 0, 'episodes_restored': 0, 'kept_files': set()}
+
+		# Newest-first by ep_idx — drop oldest until we fit under the cap.
+		entries.sort(key=lambda x: x[0], reverse=True)
+		cap = max_total_steps if max_total_steps is not None else float('inf')
+		kept = []
+		running = 0
+		for ep_idx, length, fname in entries:
+			if running + length > cap:
+				continue
+			kept.append((ep_idx, length, fname))
+			running += length
+
+		# Replay in chronological order so internal episode counters advance
+		# the way they would have during live training.
+		kept.sort(key=lambda x: x[0])
+		transitions = 0
+		for _ep_idx, length, fname in kept:
+			td = torch.load(episode_dir / fname, map_location='cpu', weights_only=False)
+			# `add()` re-stamps the episode field with the current _num_eps,
+			# so internal sampling stays consistent regardless of the
+			# original ep_idx.
+			self.add(td)
+			transitions += length
+
+		return {
+			'transitions_restored': transitions,
+			'episodes_restored': len(kept),
+			'kept_files': {x[2] for x in kept},
+		}
+
+	@staticmethod
+	def prune_episode_dir_to_cap(episode_dir, max_total_steps):
+		"""FIFO-prune oldest episodes (by ep_idx) until total transitions ≤ cap.
+
+		Mirrors STORM's prune_episode_dir_to_cap: disk-side bound matches the
+		in-memory ring-buffer cap so disk usage tracks RAM usage. Returns the
+		number of files removed.
+		"""
+		episode_dir = Path(episode_dir)
+		if not episode_dir.is_dir():
+			return 0
+		entries = []
+		for fname in os.listdir(episode_dir):
+			parsed = Buffer._parse_episode_filename(fname)
+			if parsed is None:
+				continue
+			ep_idx, length = parsed
+			entries.append((ep_idx, length, fname))
+		if not entries:
+			return 0
+		entries.sort(key=lambda x: x[0])  # oldest first
+		total = sum(length for _, length, _ in entries)
+		removed = 0
+		i = 0
+		while total > max_total_steps and i < len(entries):
+			_idx, length, fname = entries[i]
+			try:
+				os.remove(episode_dir / fname)
+				removed += 1
+				total -= length
+			except FileNotFoundError:
+				pass
+			i += 1
+		return removed
+
+	@staticmethod
+	def erase_over_episode_files(episode_dir, kept_filenames):
+		"""Delete files in ``episode_dir`` whose name is NOT in ``kept_filenames``.
+
+		Used after a load to drop episodes that didn't make it back into the
+		(bounded) in-memory ring. Returns the number of files removed.
+		"""
+		episode_dir = Path(episode_dir)
+		if not episode_dir.is_dir():
+			return 0
+		removed = 0
+		for fname in os.listdir(episode_dir):
+			if Buffer._parse_episode_filename(fname) is None:
+				continue
+			if fname in kept_filenames:
+				continue
+			try:
+				os.remove(episode_dir / fname)
+				removed += 1
+			except FileNotFoundError:
+				pass
+		return removed
