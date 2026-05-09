@@ -292,6 +292,12 @@ def main(args):
     num_tasks = len(args.tasks)
     if len(args.task_steps) != num_tasks:
         raise ValueError('--task-steps must have one value per task.')
+    if args.task_buffer_sizes is not None:
+        if len(args.task_buffer_sizes) != num_tasks:
+            raise ValueError('--task-buffer-sizes must have one value per task.')
+        task_buffer_sizes = list(args.task_buffer_sizes)
+    else:
+        task_buffer_sizes = [args.buffer_size] * num_tasks
 
     base_logdir = Path(args.logdir).expanduser().resolve()
     base_logdir.mkdir(parents=True, exist_ok=True)
@@ -300,7 +306,7 @@ def main(args):
     shared = dict(
         model_size=args.model_size,
         batch_size=args.batch_size,
-        buffer_size=args.buffer_size,
+        # buffer_size is set per-task below (see task_buffer_sizes).
         horizon=args.horizon,
         mpc=args.mpc,
         eval_freq=args.eval_freq,
@@ -322,9 +328,10 @@ def main(args):
     task_cfgs = []
     for i in range(num_tasks):
         task_logdir = base_logdir / f'task{i + 1}_{args.tasks[i]}'
+        per_task = {**shared, 'buffer_size': int(task_buffer_sizes[i])}
         cfg = build_task_cfg(
             args.tasks[i], args.task_steps[i], task_logdir,
-            shared, args.seed,
+            per_task, args.seed,
         )
         task_cfgs.append(cfg)
 
@@ -630,7 +637,12 @@ if __name__ == '__main__':
     # TDMPC2 hyperparams (shared across tasks)
     p.add_argument('--model-size', type=int, default=5)
     p.add_argument('--batch-size', type=int, default=256)
-    p.add_argument('--buffer-size', type=int, default=50000)
+    p.add_argument('--buffer-size', type=int, default=50000,
+                   help='Single buffer size, broadcast to every task. '
+                        'Ignored if --task-buffer-sizes is set.')
+    p.add_argument('--task-buffer-sizes', nargs='+', type=int, default=None,
+                   help='Per-task buffer caps (one per --tasks entry). '
+                        'Overrides --buffer-size when given.')
     p.add_argument('--horizon', type=int, default=3)
     p.add_argument('--mpc', dest='mpc', action='store_true')
     p.add_argument('--no-mpc', dest='mpc', action='store_false')
