@@ -55,6 +55,7 @@ import argparse
 import gc
 import json
 import random
+import shutil
 import sys
 from pathlib import Path
 from time import time
@@ -178,15 +179,26 @@ def load_er_episodes(path):
 def train_one_task(cfg, agent, env, buffer, logger,
                    global_step_start, eval_fn, skip_pretrain,
                    episode_log,
-                   task_idx=0, num_tasks=1, task_name=''):
+                   task_idx=0, num_tasks=1, task_name='',
+                   episode_dir=None, save_episodes=True,
+                   buffer_cap=None, prune_every_n_eps=5):
     """Run TD-MPC2's online training loop and record every completed episode.
 
     Behaves identically to `sequential_train.train_one_task`, but appends
     each completed-episode TensorDict to `episode_log` (in CPU memory)
     AFTER it has been added to the replay buffer. The caller then
     reservoir-samples `episode_log` for the on-disk ER dump at task end.
+
+    `episode_dir` (when ``save_episodes=True``) is where each completed
+    episode is persisted to disk for full-state resume; FIFO-pruned to
+    ``buffer_cap`` transitions. This is independent of the cross-task ER
+    dump (`er_episodes.pt`) — both can coexist.
     """
     logger.global_step_fn = lambda s: global_step_start + s
+    if save_episodes and episode_dir is not None:
+        Path(episode_dir).mkdir(parents=True, exist_ok=True)
+    if buffer_cap is None:
+        buffer_cap = int(min(cfg.buffer_size, cfg.steps))
 
     pbar = tqdm(
         total=cfg.steps,
@@ -249,6 +261,14 @@ def train_one_task(cfg, agent, env, buffer, logger,
                     # ER capture: keep a CPU copy of every completed episode.
                     # `tds` are already on CPU (see _to_td), so this is cheap.
                     episode_log.append(ep_td.detach().cpu())
+                    # On-disk persistence for full-state resume.
+                    if save_episodes and episode_dir is not None:
+                        try:
+                            Buffer.save_episode(ep_td, episode_dir, ep_idx)
+                            if ep_idx % prune_every_n_eps == 0:
+                                Buffer.prune_episode_dir_to_cap(episode_dir, buffer_cap)
+                        except Exception as e:
+                            print(colored(f'[seq_train_er] save_episode failed: {e}', 'red'))
 
                 obs = env.reset()
                 tds = [_to_td(env, obs)]
@@ -322,6 +342,11 @@ def main(args):
         save_agent=True,
         exp_name=args.exp_name,
         compile=args.compile,
+        # Replay-buffer persistence + storage knobs (read by Buffer / trainer).
+        save_episodes=args.save_episodes,
+        episode_dir=None,                     # per-task dir is built inside the task loop
+        buffer_storage_device=args.buffer_storage_device,
+        prune_every_n_episodes=args.prune_every_n_episodes,
     )
 
     # ---- per-task configs --------------------------------------------------
@@ -450,9 +475,49 @@ def main(args):
             global_step_at_start=global_step,
         )
 
+        # Buffer isolation for in-task `train_eps/`: cross-task replay in ER
+        # comes from each previous task's reservoir-sampled `er_episodes.pt`,
+        # not from the in-task `train_eps/` dir. Once a previous task is
+        # fully completed its `train_eps/` is no longer needed for resume,
+        # so delete it on entry to a later task. (A partially-trained earlier
+        # task is protected so its resume path stays intact.)
+        for j in range(task_idx):
+            prev_done = (
+                progress is not None
+                and progress.get('tasks', {}).get(str(j), {}).get('completed')
+            )
+            if not prev_done:
+                continue
+            prev_eps = (
+                base_logdir / f'task{j + 1}_{args.tasks[j]}' / 'train_eps'
+            )
+            if prev_eps.is_dir():
+                print(colored(
+                    f'>>> Removing previous-task replay dir: {prev_eps}',
+                    'yellow'))
+                shutil.rmtree(prev_eps, ignore_errors=True)
+
         # Fresh env + buffer for this task --------------------------------
         train_env = make_env(cfg)
         buffer = Buffer(cfg)
+
+        # Per-task on-disk episode dir for full-state resume.
+        task_episode_dir = task_logdir / 'train_eps'
+        task_buffer_cap = int(min(cfg.buffer_size, cfg.steps))
+        if args.save_episodes and task_episode_dir.is_dir():
+            stats = buffer.load_from_directory(
+                task_episode_dir, max_total_steps=task_buffer_cap)
+            if stats['episodes_restored'] > 0:
+                print(colored(
+                    f'>>> Replayed {stats["transitions_restored"]:,} transitions '
+                    f'from {stats["episodes_restored"]} episodes '
+                    f'(cap {task_buffer_cap:,}).',
+                    'green'))
+                if stats['kept_files']:
+                    dropped = Buffer.erase_over_episode_files(
+                        task_episode_dir, stats['kept_files'])
+                    if dropped:
+                        print(colored(f'>>> Pruned {dropped} stale episode files.', 'yellow'))
 
         logger = SequentialLogger(
             cfg, task_idx, num_tasks, task_name, wandb_run,
@@ -547,6 +612,10 @@ def main(args):
             task_idx=task_idx,
             num_tasks=num_tasks,
             task_name=task_name,
+            episode_dir=task_episode_dir,
+            save_episodes=args.save_episodes,
+            buffer_cap=task_buffer_cap,
+            prune_every_n_eps=args.prune_every_n_episodes,
         )
 
         # Final cross-task eval + save ------------------------------------
@@ -667,6 +736,21 @@ if __name__ == '__main__':
     p.add_argument('--episodic', dest='episodic', action='store_true')
     p.add_argument('--no-episodic', dest='episodic', action='store_false')
     p.set_defaults(episodic=True)
+
+    # Replay-buffer persistence (mirrors STORM's train_eps/ scheme).
+    p.add_argument('--save-episodes', dest='save_episodes', action='store_true',
+                   help='Persist completed episodes to {task_logdir}/train_eps/ '
+                        'and replay them back into the buffer on resume. '
+                        'Independent of the cross-task ER dump (er_episodes.pt).')
+    p.add_argument('--no-save-episodes', dest='save_episodes', action='store_false')
+    p.set_defaults(save_episodes=True)
+    p.add_argument('--prune-every-n-episodes', type=int, default=5,
+                   help='How often to FIFO-prune the on-disk episode dir down to '
+                        '<= buffer_size transitions (1 = every episode).')
+    p.add_argument('--buffer-storage-device', type=str, default='auto',
+                   choices=['auto', 'cuda', 'cpu'],
+                   help='Override the auto CUDA/CPU heuristic for the replay '
+                        'buffer storage. `cuda` forces GPU (OOMs if it does not fit).')
 
     # ER knobs
     p.add_argument(
