@@ -490,6 +490,13 @@ def main(args):
         episode_dir=None,                     # per-task dir is built inside the task loop
         buffer_storage_device=args.buffer_storage_device,
         prune_every_n_episodes=args.prune_every_n_episodes,
+        # PRISM-WM (MoE) — wired into WorldModel via these flags. Defaults
+        # to False (use_moe), so existing non-MoE sequential runs are
+        # byte-identical. See run_prismatic_single.sh for the canonical
+        # single-task launcher.
+        use_moe=args.use_moe,
+        num_experts=args.num_experts,
+        moe_residual_dynamics=args.moe_residual_dynamics,
     )
 
     # ---- Build per-task configs up-front -----------------------------------
@@ -579,6 +586,12 @@ def main(args):
     print(f'  Logdir: {base_logdir}')
     print(f'  Seed: {args.seed}')
     print(f'  Wandb project: {args.wandb_project}')
+    if args.use_moe:
+        print(colored(
+            f'  PRISM-WM: K={args.num_experts} experts, '
+            f'residual_dynamics={args.moe_residual_dynamics}  '
+            f'(no Gram-Schmidt)',
+            'cyan'))
     print('=' * 64)
 
     # Eval env cache (lazy; persist across tasks for cross-task eval) --------
@@ -837,5 +850,27 @@ if __name__ == '__main__':
                    choices=['auto', 'cuda', 'cpu'],
                    help='Override the auto CUDA/CPU heuristic for the replay '
                         'buffer storage. `cuda` forces GPU (OOMs if it does not fit).')
+
+    # PRISM-WM (MoE) — Prismatic World Model. When --use-moe is set, the
+    # monolithic dynamics + reward heads are replaced by K-expert mixtures
+    # with a softmax router. Gram-Schmidt orthogonalization is intentionally
+    # omitted so we can observe whether experts collapse without it.
+    # Defaults match config.yaml (use_moe=false), so omitting these flags
+    # reproduces the original sequential pipeline byte-for-byte.
+    p.add_argument('--use-moe', dest='use_moe', action='store_true',
+                   help='Enable PRISM-WM MoE dynamics + reward heads.')
+    p.add_argument('--no-use-moe', dest='use_moe', action='store_false')
+    p.set_defaults(use_moe=False)
+    p.add_argument('--num-experts', type=int, default=4,
+                   help='Number of experts in each MoE block (only used when --use-moe).')
+    p.add_argument('--moe-residual-dynamics', dest='moe_residual_dynamics',
+                   action='store_true',
+                   help='If set, dynamics MoE applies residual + post-residual '
+                        'SimNorm: z_{t+1} = SimNorm(z + ∆z). Empirically the '
+                        'non-residual setting works better with tdmpc2 SimNorm '
+                        'latents — kept false by default.')
+    p.add_argument('--no-moe-residual-dynamics', dest='moe_residual_dynamics',
+                   action='store_false')
+    p.set_defaults(moe_residual_dynamics=False)
 
     main(p.parse_args())
