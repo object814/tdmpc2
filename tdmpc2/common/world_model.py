@@ -23,13 +23,30 @@ class WorldModel(nn.Module):
 			for i in range(len(cfg.tasks)):
 				self._action_masks[i, :cfg.action_dims[i]] = 1.
 		self._encoder = layers.enc(cfg)
-		self._dynamics = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
-		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1))
+		dyn_in = cfg.latent_dim + cfg.action_dim + cfg.task_dim
+		rew_in = cfg.latent_dim + cfg.action_dim + cfg.task_dim
+		self._use_moe = bool(getattr(cfg, 'use_moe', False))
+		if self._use_moe:
+			K = int(getattr(cfg, 'num_experts', 4))
+			self._dynamics = layers.MoEBlock(dyn_in, cfg.mlp_dim, cfg.latent_dim, num_experts=K, act=layers.SimNorm(cfg))
+			self._reward = layers.MoEBlock(rew_in, cfg.mlp_dim, max(cfg.num_bins, 1), num_experts=K)
+		else:
+			self._dynamics = layers.mlp(dyn_in, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
+			self._reward = layers.mlp(rew_in, 2*[cfg.mlp_dim], max(cfg.num_bins, 1))
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
 		self._Qs = layers.Ensemble([layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)])
 		self.apply(init.weight_init)
-		init.zero_([self._reward[-1].weight, self._Qs.params["2", "weight"]])
+		_reward_last = self._reward.head if self._use_moe else self._reward[-1]
+		init.zero_([_reward_last.weight, self._Qs.params["2", "weight"]])
+
+		# Test: re-normalise after residual
+		# Stateless SimNorm reused inside `next()` to reproject (z + ∆z) onto
+		# tdmpc2's simplex latent (groups of 8 summing to 1). Without this
+		# the residual sum doubles per rollout step and the consistency loss
+		# can't fit a SimNorm-encoded target.
+		self._post_residual_simnorm = layers.SimNorm(cfg) if self._use_moe else None
+		# Test: re-normalise after residual
 
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
 		self.register_buffer("log_std_dif", torch.tensor(cfg.log_std_max) - self.log_std_min)
@@ -139,11 +156,22 @@ class WorldModel(nn.Module):
 	def next(self, z, a, task):
 		"""
 		Predicts the next latent state given the current latent state and action.
+
+		When `cfg.use_moe` is set, the dynamics MoE predicts a residual ∆z and
+		the next latent is `z + ∆z` (PRISM-WM, Algorithm 1, line 13).
+		Otherwise the original monolithic dynamics model returns the next
+		latent directly.
 		"""
+		z_res = z
 		if self.cfg.multitask:
 			z = self.task_emb(z, task)
 		z = torch.cat([z, a], dim=-1)
-		return self._dynamics(z)
+		out = self._dynamics(z)
+		if self._use_moe and getattr(self.cfg, 'moe_residual_dynamics', True):
+			# Test: re-normalise after residual
+			return self._post_residual_simnorm(z_res + out)
+			# Test: re-normalise after residual
+		return out
 
 	def reward(self, z, a, task):
 		"""
@@ -153,6 +181,43 @@ class WorldModel(nn.Module):
 			z = self.task_emb(z, task)
 		z = torch.cat([z, a], dim=-1)
 		return self._reward(z)
+
+	def gate_weights(self, z, a, task):
+		"""
+		Returns per-step softmax gate weights of the dynamics and reward MoE
+		blocks for the given (z, a). Only valid when `cfg.use_moe=True`.
+		Returns a dict with keys 'dynamics' and 'reward', each a tensor of
+		shape [..., num_experts].
+		"""
+		assert self._use_moe, "gate_weights() only available when cfg.use_moe=True"
+		if self.cfg.multitask:
+			z = self.task_emb(z, task)
+		x = torch.cat([z, a], dim=-1)
+		_, w_dyn = self._dynamics.forward_with_gate(x)
+		_, w_rew = self._reward.forward_with_gate(x)
+		return {"dynamics": w_dyn, "reward": w_rew}
+
+	def gate_diagnostics(self, z, a, task):
+		"""
+		Like `gate_weights`, but also returns the pre-aggregation per-expert
+		feature stack of both blocks. The feature stack lets the evaluator
+		measure *functional* expert collapse (the failure mode Gram-Schmidt
+		is supposed to prevent) — two experts can be functionally identical
+		even when the gate distributes evenly between them.
+
+		Returns: {'dynamics': {'weights': [..., K], 'features': [..., K, H]},
+		          'reward':   {'weights': [..., K], 'features': [..., K, H]}}
+		"""
+		assert self._use_moe, "gate_diagnostics() only available when cfg.use_moe=True"
+		if self.cfg.multitask:
+			z = self.task_emb(z, task)
+		x = torch.cat([z, a], dim=-1)
+		_, w_dyn, f_dyn = self._dynamics.forward_with_diagnostics(x)
+		_, w_rew, f_rew = self._reward.forward_with_diagnostics(x)
+		return {
+			"dynamics": {"weights": w_dyn, "features": f_dyn},
+			"reward":   {"weights": w_rew, "features": f_rew},
+		}
 	
 	def termination(self, z, task, unnormalized=False):
 		"""

@@ -119,6 +119,73 @@ class NormedLinear(nn.Linear):
 			f"act={self.act.__class__.__name__})"
 
 
+class MoEBlock(nn.Module):
+	"""
+	Mixture-of-Experts block from PRISM-WM (without Gram-Schmidt
+	orthogonalization). Routes each input to K parallel two-layer
+	expert MLPs via a softmax-normalized linear gate, aggregates
+	their feature outputs by a weighted sum, and projects to
+	`out_dim` with an optional final activation.
+
+	Mirrors the MoEBlock in the PRISM-WM appendix (gate -> ParallelLayer
+	of K experts -> head). Used as a drop-in replacement for the
+	monolithic `mlp(...)` call in TD-MPC2's dynamics and reward models.
+	"""
+
+	def __init__(self, in_dim, hidden_dim, out_dim, num_experts=4, act=None, dropout=0.):
+		super().__init__()
+		self.num_experts = int(num_experts)
+		self.in_dim = int(in_dim)
+		self.hidden_dim = int(hidden_dim)
+		self.out_dim = int(out_dim)
+		self.gate = nn.Linear(in_dim, self.num_experts, bias=False)
+		self.experts = nn.ModuleList([
+			nn.Sequential(
+				NormedLinear(in_dim, hidden_dim, dropout=dropout),
+				NormedLinear(hidden_dim, hidden_dim),
+			) for _ in range(self.num_experts)
+		])
+		if act is not None:
+			self.head = NormedLinear(hidden_dim, out_dim, act=act)
+		else:
+			self.head = nn.Linear(hidden_dim, out_dim)
+
+	def _route(self, x):
+		gate_logits = self.gate(x)                                         # [..., K]
+		weights = F.softmax(gate_logits, dim=-1)                           # [..., K]
+		feats = torch.stack([E(x) for E in self.experts], dim=-2)          # [..., K, H]
+		combined = (weights.unsqueeze(-1) * feats).sum(dim=-2)             # [..., H]
+		return combined, weights
+
+	def forward(self, x):
+		combined, _ = self._route(x)
+		return self.head(combined)
+
+	def forward_with_gate(self, x):
+		"""Same as forward, but also returns the per-expert softmax weights
+		(shape [..., num_experts]). Used for diagnostics / visualization."""
+		combined, weights = self._route(x)
+		return self.head(combined), weights
+
+	def forward_with_diagnostics(self, x):
+		"""Like forward, but also returns the gate weights AND the
+		pre-aggregation per-expert feature stack. Used by evaluation to
+		measure functional collapse (cosine similarity between expert
+		outputs even when the gate distribution looks healthy)."""
+		gate_logits = self.gate(x)
+		weights = F.softmax(gate_logits, dim=-1)                           # [..., K]
+		feats = torch.stack([E(x) for E in self.experts], dim=-2)          # [..., K, H]
+		combined = (weights.unsqueeze(-1) * feats).sum(dim=-2)             # [..., H]
+		return self.head(combined), weights, feats
+
+	def __repr__(self):
+		head_out = getattr(self.head, 'out_features', self.out_dim)
+		return (
+			f"MoEBlock(num_experts={self.num_experts}, in={self.in_dim}, "
+			f"hidden={self.hidden_dim}, out={head_out})"
+		)
+
+
 def mlp(in_dim, mlp_dims, out_dim, act=None, dropout=0.):
 	"""
 	Basic building block of TD-MPC2.

@@ -72,6 +72,14 @@ num_q: 5
 dropout: 0.01
 simnorm_dim: 8
 
+# Prismatic World Model (MoE) — replaces the monolithic dynamics + reward
+# heads with K-expert mixtures + softmax router. Gram-Schmidt orthogonalization
+# from the paper is intentionally omitted (so we can observe whether experts
+# collapse without it).
+use_moe: false
+num_experts: 4
+moe_residual_dynamics: true     # z_{t+1} = z_t + ∆z (PRISM-WM, Algorithm 1)
+
 # logging
 wandb_project: ???
 wandb_entity: ???
