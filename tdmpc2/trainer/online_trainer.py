@@ -174,6 +174,12 @@ class OnlineTrainer(Trainer):
 	def train(self):
 		"""Train a TD-MPC2 agent."""
 		train_metrics, done, eval_next = {}, True, False
+		# `info` is set by env.step() inside the loop; initialise to None so the
+		# "previous-episode finalize" branch is skipped on the very first
+		# iteration. After resume_from() bumps self._step above 0, the old
+		# `self._step > 0` guard alone would let that branch run and dereference
+		# an unbound `info`.
+		info = None
 		while self._step <= self.cfg.steps:
 			# Evaluate agent periodically
 			if self._step % self.cfg.eval_freq == 0:
@@ -192,7 +198,7 @@ class OnlineTrainer(Trainer):
 					self.logger.log(eval_metrics, 'eval')
 					eval_next = False
 
-				if self._step > 0:
+				if self._step > 0 and info is not None:
 					if info['terminated'] and not self.cfg.episodic:
 						raise ValueError('Termination detected but you are not in episodic mode. ' \
 						'Set `episodic=true` to enable support for terminations.')
