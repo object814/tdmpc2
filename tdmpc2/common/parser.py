@@ -73,6 +73,15 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 		if cfg.task == 'mt30' and cfg.model_size == 19:
 			cfg.latent_dim = 512 # This checkpoint is slightly smaller
 
+	# DINO encoder: the frozen ViT dominates compute and blows up
+	# torch.compile time (many guard variants x a 12-block ViT through
+	# Inductor, re-paid per node since the Inductor cache is node-local),
+	# while eager timm already uses fused SDPA attention. Force compile off.
+	if str(cfg.get('encoder_type', 'default')) == 'dino' and cfg.get('compile', False):
+		print('[dino] encoder_type=dino -> forcing compile=false '
+		      '(ViT-dominated compute; compile costs >> gains here)')
+		cfg.compile = False
+
 	# Multi-task
 	cfg.multitask = cfg.task in TASK_SET.keys()
 	if cfg.multitask:

@@ -4,7 +4,7 @@ defaults:
 # environment
 task: dog-run
 obs: state
-episodic: false
+episodic: true
 
 # metaworld (custom) — used when task starts with `mw-` or `metaworld_`
 image_size: 128
@@ -68,17 +68,62 @@ num_channels: 32
 mlp_dim: 512
 latent_dim: 512
 task_dim: 96
+
+# Encoder type for the rgb branch (DINO+PRISM hybrid, cf. DINO-WM arXiv:2411.04983).
+#   default -> conv/conv_deep CNN trained with RL (current behaviour).
+#   dino    -> frozen DINOv2 backbone (timm, loaded from a LOCAL checkpoint —
+#              no internet at runtime) + trainable pooling/projection head.
+#              Mutually exclusive with pretrained_encoder. The state branch
+#              and fusion layer are unchanged, so everything downstream of
+#              the latent is identical across encoder types.
+encoder_type: default
+dino_model: vit_small_patch14_dinov2   # timm model name (ViT-S/14, 21M frozen params)
+dino_weights: null                     # local .safetensors; null -> <repo>/pretrain_data/dino/<dino_model>.safetensors
+dino_input_size: 224                   # rgb is bicubic-resized per camera to this before the ViT (multiple of 14)
+dino_pool: attn                        # attn | mean | cls — how patch tokens reduce to a per-camera vector
+dino_pool_queries: 4                   # learnable queries for dino_pool=attn
+dino_amp: true                         # bf16 autocast for the frozen backbone forward (CUDA only)
+
+# Pretrained encoder (offline autoencoder pretraining; see tdmpc2/pretrain/).
+# pretrained_encoder: path to an encoder checkpoint produced by
+#   pretrain/pretrain_encoder.py (dict with key 'encoder' = enc() state_dict).
+#   null/empty -> fresh random encoder (default; current behaviour).
+# freeze_encoder: when true, the loaded encoder is held fixed
+#   (requires_grad=False, excluded from the optimizer) for the whole run.
+#   Ignored when pretrained_encoder is null.
+pretrained_encoder: null
+freeze_encoder: false
 num_q: 5
 dropout: 0.01
 simnorm_dim: 8
 
 # Prismatic World Model (MoE) — replaces the monolithic dynamics + reward
-# heads with K-expert mixtures + softmax router. Gram-Schmidt orthogonalization
-# from the paper is intentionally omitted (so we can observe whether experts
-# collapse without it).
+# heads with K-expert mixtures + softmax router. Faithful to PRISM-WM's
+# official `core/common/layers.py:MoEBlock` (arXiv:2512.08411): the MoE
+# directly emits the next latent on the SimNorm simplex (no residual);
+# the gate sees task_emb (multitask) or [z, a] (single-task) plus a
+# scalar τ context column; softmax has a scheduled temperature τ that
+# is updated by entropy feedback toward `H_target = 0.75·log(num_experts)`.
 use_moe: false
-num_experts: 4
-moe_residual_dynamics: true     # z_{t+1} = z_t + ∆z (PRISM-WM, Algorithm 1)
+num_experts: 4                  # used only by single-task PRISM (run_prismatic_single.sh)
+# Continual-learning specifics (progmoe_training/* + sequential_train.py).
+# For single-task runs these are ignored. `num_tasks` is filled in by the
+# sequential trainer from the --tasks list.
+#  - progressive_moe=true  (progmoe): MaskedMoEBlock grows its active expert
+#    window by `K_per_task` each task and freezes prior experts. total_K =
+#    num_tasks * K_per_task.
+#  - progressive_moe=false (naive sequential): static full-K MoE — all
+#    `num_experts` experts always active + trainable; task boundaries only
+#    swap the per-task heads. total_K = num_experts.
+num_tasks: 1
+K_per_task: 4
+progressive_moe: true           # false -> naive static-K sequential baseline
+use_orthogonal: false           # Gram-Schmidt across the K experts (paper default: true)
+moe_tau_init: 1.8               # initial softmax temperature
+moe_tau_min: 0.5                # lower clamp
+moe_tau_max: 2.0                # upper clamp
+moe_beta: 0.02                  # τ adaptation step size
+moe_freeze_frac: 0.05           # fraction of `steps` to hold τ fixed at init (min 5k)
 
 # logging
 wandb_project: ???

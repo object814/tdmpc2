@@ -131,3 +131,7 @@ dmypy.json
 logdir/
 sweep/
 training/
+# Offline pretraining data + frozen backbone weights (large binaries)
+pretrain_data/
+# Retired scripts kept locally for reference
+archive/

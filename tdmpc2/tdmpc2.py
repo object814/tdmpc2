@@ -20,8 +20,10 @@ class TDMPC2(torch.nn.Module):
 		self.cfg = cfg
 		self.device = torch.device('cuda:0')
 		self.model = WorldModel(cfg).to(self.device)
+		# Only optimize encoder params that require grad — when the encoder is
+		# loaded pretrained + frozen (cfg.freeze_encoder), this group is empty.
 		self.optim = torch.optim.Adam([
-			{'params': self.model._encoder.parameters(), 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
+			{'params': [p for p in self.model._encoder.parameters() if p.requires_grad], 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
 			{'params': self.model._dynamics.parameters()},
 			{'params': self.model._reward.parameters()},
 			{'params': self.model._termination.parameters() if self.cfg.episodic else []},
@@ -69,6 +71,14 @@ class TDMPC2(torch.nn.Module):
 		"""
 		frac = episode_length/self.cfg.discount_denom
 		return min(max((frac-1)/(frac), self.cfg.discount_min), self.cfg.discount_max)
+
+	def set_current_task(self, task_idx):
+		"""Forward to WorldModel.set_current_task. No-op when the model
+		isn't running in task_id_routing mode."""
+		self.model.set_current_task(task_idx)
+
+	def current_task(self):
+		return self.model.current_task()
 
 	def save(self, fp):
 		"""

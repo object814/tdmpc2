@@ -3,20 +3,20 @@ from torch.nn import Buffer
 
 
 class RunningScale(torch.nn.Module):
-	"""Running trimmed scale estimator."""
+	"""Running trimmed scale estimator.
+
+	`value` and `_percentiles` are buffers, so the default `nn.Module`
+	state_dict() / load_state_dict() handle save+load correctly — including
+	when this module is held as a child of a larger nn.Module (e.g.
+	TaskModules), where the parent traversal passes kwargs the previous
+	custom override didn't accept.
+	"""
 
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
 		self.value = Buffer(torch.ones(1, dtype=torch.float32, device=torch.device('cuda:0')))
 		self._percentiles = Buffer(torch.tensor([5, 95], dtype=torch.float32, device=torch.device('cuda:0')))
-
-	def state_dict(self):
-		return dict(value=self.value, percentiles=self._percentiles)
-
-	def load_state_dict(self, state_dict):
-		self.value.copy_(state_dict['value'])
-		self._percentiles.copy_(state_dict['percentiles'])
 
 	def _positions(self, x_shape):
 		positions = self._percentiles * (x_shape-1) / 100
