@@ -251,6 +251,15 @@ class SequentialLogger:
             return
         fp = self._model_dir / f'{identifier}.pt'
         agent.save(fp)
+        # Periodic (step-numbered) saves keep only the latest snapshot on
+        # disk; named checkpoints (final.pt, …) are never pruned.
+        if str(identifier).isdigit():
+            for old in self._model_dir.glob('*.pt'):
+                if old.stem.isdigit() and int(old.stem) != int(identifier):
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
 
     def finish(self, agent=None):
         if agent is not None:

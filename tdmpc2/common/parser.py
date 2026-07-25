@@ -82,6 +82,18 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 		      '(ViT-dominated compute; compile costs >> gains here)')
 		cfg.compile = False
 
+	# Pretrained encoder: with freeze_encoder=true the encoder param group is
+	# empty (requires_grad filter in TDMPC2.__init__), which knocks Dynamo off
+	# its static-address fast path for Adam and crashes guard construction on
+	# the Parameter-keyed optimizer state dict once it fills after the first
+	# step (InternalTorchDynamoError: SyntaxError). Force compile off for all
+	# pretrained-encoder runs so preEnc/preEncFr stay comparable to each other.
+	if cfg.get('pretrained_encoder', None) and cfg.get('compile', False):
+		print('[pretrain] pretrained_encoder set -> forcing compile=false '
+		      '(Dynamo cannot guard the optimizer state dict with a frozen/'
+		      'loaded encoder param group)')
+		cfg.compile = False
+
 	# Multi-task
 	cfg.multitask = cfg.task in TASK_SET.keys()
 	if cfg.multitask:

@@ -122,6 +122,25 @@ class OnlineTrainer(Trainer):
 			return None
 
 	@staticmethod
+	def _prune_step_ckpts(model_dir, keep_step):
+		"""Delete step-numbered `<step>.pt` checkpoints other than `keep_step`,
+		so only the latest periodic snapshot stays on disk. Named checkpoints
+		(final.pt, …) are untouched, and resume still finds the survivor via
+		`_latest_ckpt`."""
+		model_dir = Path(model_dir)
+		if not model_dir.is_dir():
+			return
+		for fname in os.listdir(model_dir):
+			if not fname.endswith('.pt'):
+				continue
+			stem = fname[:-3]
+			if stem.isdigit() and int(stem) != int(keep_step):
+				try:
+					(model_dir / fname).unlink()
+				except OSError:
+					pass
+
+	@staticmethod
 	def _latest_ckpt(model_dir):
 		"""Return (path, step) of the highest-step `<step>.pt` in model_dir, or None."""
 		model_dir = Path(model_dir)
@@ -174,6 +193,11 @@ class OnlineTrainer(Trainer):
 	def train(self):
 		"""Train a TD-MPC2 agent."""
 		train_metrics, done, eval_next = {}, True, False
+		# `info` doubles as the "episode in flight" flag: it is only set by
+		# env.step() below, so it is None on the first iteration of a fresh
+		# start AND of a resumed run (where self._step > 0 but no episode has
+		# been collected in this process yet).
+		info = None
 		while self._step <= self.cfg.steps:
 			# Evaluate agent periodically
 			if self._step % self.cfg.eval_freq == 0:
@@ -182,6 +206,7 @@ class OnlineTrainer(Trainer):
 			# Checkpoint agent periodically (world model + actor + critics live in a single state_dict)
 			if self.cfg.save_freq > 0 and self._step > 0 and self._step % self.cfg.save_freq == 0:
 				self.logger.save_agent(self.agent, identifier=self._step)
+				self._prune_step_ckpts(self.logger.model_dir, keep_step=self._step)
 				self._save_manifest()
 
 			# Reset environment
@@ -192,7 +217,7 @@ class OnlineTrainer(Trainer):
 					self.logger.log(eval_metrics, 'eval')
 					eval_next = False
 
-				if self._step > 0:
+				if info is not None:
 					if info['terminated'] and not self.cfg.episodic:
 						raise ValueError('Termination detected but you are not in episodic mode. ' \
 						'Set `episodic=true` to enable support for terminations.')
