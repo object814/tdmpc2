@@ -451,6 +451,36 @@ class AttnPool(nn.Module):
 		return out.flatten(1)
 
 
+def dino_projector(in_dim, out_dim, cfg, act=None):
+	"""Build the DINO rgb projector: pooled ViT features -> encoder out_dim.
+
+	`cfg.dino_head_hidden > 0` (default) gives an MLP with one hidden layer
+	(Linear -> LayerNorm -> Mish -> Linear -> LayerNorm [-> act]); the 4608->256
+	single Linear it replaces was an 18x compression in one affine map, which
+	bottlenecks everything the frozen backbone provides. Setting
+	`dino_head_hidden: 0` restores that original single-Linear head so the two
+	can be compared directly.
+
+	`act` is the branch-dependent tail activation supplied by `enc()`:
+	SimNorm for an rgb-only encoder (whose output IS the latent), None for the
+	multimodal case (where the fusion layer applies SimNorm instead).
+	"""
+	hidden = int(getattr(cfg, 'dino_head_hidden', 0) or 0)
+	if hidden > 0:
+		layers_ = [
+			nn.Linear(in_dim, hidden),
+			nn.LayerNorm(hidden),
+			nn.Mish(inplace=False),
+			nn.Linear(hidden, out_dim),
+			nn.LayerNorm(out_dim),
+		]
+	else:
+		layers_ = [nn.Linear(in_dim, out_dim), nn.LayerNorm(out_dim)]
+	if act is not None:
+		layers_.append(act)
+	return nn.Sequential(*layers_)
+
+
 def _default_dino_weights(model_name):
 	"""Default local checkpoint path: <tdmpc2 repo root>/pretrain_data/dino/.
 
@@ -534,11 +564,19 @@ class DinoRGBEncoder(nn.Module):
 		else:
 			self.pool = None
 			per_cam_dim = embed_dim
-		# Mirrors the conv_deep tail: Linear -> LayerNorm -> optional act.
-		head = [nn.Linear(self.num_cameras * per_cam_dim, out_dim), nn.LayerNorm(out_dim)]
-		if act is not None:
-			head.append(act)
-		self.head = nn.Sequential(*head)
+		self.feature_dim = self.num_cameras * per_cam_dim
+		self.out_dim = out_dim
+
+		# When the backbone owns per-task projectors, this branch stops at the
+		# pooled features and `PrismBackbone.encode` applies the projector for
+		# the current task. Keeping the projector out here is what lets it be
+		# frozen per task alongside that task's MoE experts.
+		self.externalize_projector = bool(
+			getattr(cfg, 'dino_per_task_projector', False))
+		if self.externalize_projector:
+			self.head = None
+		else:
+			self.head = dino_projector(self.feature_dim, out_dim, cfg, act=act)
 
 	def train(self, mode=True):
 		"""Keep the frozen backbone in eval mode regardless of train()."""
@@ -577,13 +615,19 @@ class DinoRGBEncoder(nn.Module):
 			else:
 				pooled = self.pool(tokens)                    # [B*cams, Q*D]
 		pooled = pooled.view(B, -1)                           # [B, cams*P]
+		if self.head is None:
+			# Per-task projector mode: return pooled features; the caller
+			# (PrismBackbone.encode) applies the current task's projector.
+			return pooled
 		return self.head(pooled)
 
 	def __repr__(self):
 		n_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
 		n_frozen = sum(p.numel() for p in self.backbone.parameters())
+		proj = 'per-task (in backbone)' if self.head is None else 'internal'
 		return (f'DinoRGBEncoder(cameras={self.num_cameras}, '
 		        f'input={self.img_hw}->{self.input_size}, pool={self.pool_type}, '
+		        f'feat_dim={self.feature_dim}, projector={proj}, '
 		        f'trainable={n_trainable/1e6:.2f}M, frozen={n_frozen/1e6:.2f}M)')
 
 

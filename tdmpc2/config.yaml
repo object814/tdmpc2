@@ -83,6 +83,12 @@ dino_input_size: 224                   # rgb is bicubic-resized per camera to th
 dino_pool: attn                        # attn | mean | cls — how patch tokens reduce to a per-camera vector
 dino_pool_queries: 4                   # learnable queries for dino_pool=attn
 dino_amp: true                         # bf16 autocast for the frozen backbone forward (CUDA only)
+dino_head_hidden: 512                  # projector hidden width (0 -> single Linear, the pre-MLP behaviour)
+# Per-task projectors: give each task its OWN rgb projector MLP, frozen at the
+# task boundary alongside that task's MoE experts. Fixes representation drift
+# — with a single shared projector the frozen experts of task j keep receiving
+# a shifting input distribution while task t>j trains the projector.
+dino_per_task_projector: true
 
 # Pretrained encoder (offline autoencoder pretraining; see tdmpc2/pretrain/).
 # pretrained_encoder: path to an encoder checkpoint produced by

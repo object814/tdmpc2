@@ -110,7 +110,14 @@ class ContinualTDMPC2(nn.Module):
 			return [p for p in params if p.requires_grad]
 
 		bb_groups = []
-		enc = trainable(self.backbone._encoder.parameters())
+		# Per-task projectors belong to the encoder group: they are part of the
+		# observation->latent path and want the same enc_lr_scale. Frozen ones
+		# (completed tasks) drop out here via the requires_grad filter, exactly
+		# as frozen experts do.
+		enc_params = list(self.backbone._encoder.parameters())
+		if self.backbone._projectors is not None:
+			enc_params += list(self.backbone._projectors.parameters())
+		enc = trainable(enc_params)
 		if enc:
 			bb_groups.append({
 				'params': enc,
@@ -236,6 +243,12 @@ class ContinualTDMPC2(nn.Module):
 			if self.sdp_freeze and task_idx >= 1:
 				self.backbone._dynamics._tau_frozen = True
 			self.backbone.set_active_K((task_idx + 1) * K)
+		# 2.5) Freeze the per-task rgb projectors of every completed task, so
+		# the frozen experts of tasks [0, task_idx) keep receiving exactly the
+		# representation they were trained against. Done in BOTH progressive
+		# and static modes: the drift it prevents is a property of the shared
+		# projector, not of expert masking.
+		self.backbone.freeze_projectors_through(task_idx)
 		# 3) Switch routing one-hot.
 		self.backbone.set_current_task(task_idx)
 		# 3.6) SDP-faithful (Plan A) freeze: after task 0 freeze the shared MoE
@@ -296,11 +309,52 @@ class ContinualTDMPC2(nn.Module):
 		self.backbone.load_state_dict(sd)
 		if load_optim and 'optim' in ck:
 			try:
-				self.backbone_optim.load_state_dict(ck['optim'])
+				self._load_optim_checked(
+					self.backbone_optim, ck['optim'], 'backbone_optim')
 			except Exception as e:
 				print(colored(
 					f'[warn] backbone_optim.load_state_dict failed ({e}); '
 					f'continuing with fresh optim state.', 'yellow'))
+
+	@staticmethod
+	def _load_optim_checked(optim, state, name):
+		"""Restore optimizer state ONLY if it matches the live parameters.
+
+		`Optimizer.load_state_dict` matches saved state to parameters purely by
+		positional index within each param_group -- it does NOT verify shapes.
+		A checkpoint written when the group had a different composition (e.g.
+		a different number of unfrozen per-task projectors, or a different
+		expert freeze boundary) therefore loads "successfully" and then blows
+		up much later inside `adam.step()` with a shape mismatch that points at
+		the optimizer internals rather than at the real cause.
+
+		Validate up front and fall back to fresh moments, which costs a little
+		Adam warm-up but never corrupts training.
+		"""
+		live = [p for g in optim.param_groups for p in g['params']]
+		saved_groups = state.get('param_groups', [])
+		saved_ids = [i for g in saved_groups for i in g['params']]
+		if len(live) != len(saved_ids):
+			print(colored(
+				f'[{name}] checkpoint has {len(saved_ids)} params but the live '
+				f'optimizer has {len(live)} — the trainable set changed since '
+				f'the snapshot. Starting with fresh optimizer state.', 'yellow'))
+			return False
+		saved_state = state.get('state', {})
+		for p, sid in zip(live, saved_ids):
+			st = saved_state.get(sid) or saved_state.get(str(sid))
+			if not st:
+				continue
+			for key in ('exp_avg', 'exp_avg_sq'):
+				buf = st.get(key)
+				if buf is not None and tuple(buf.shape) != tuple(p.shape):
+					print(colored(
+						f'[{name}] shape mismatch on {key}: checkpoint '
+						f'{tuple(buf.shape)} vs live {tuple(p.shape)}. '
+						f'Starting with fresh optimizer state.', 'yellow'))
+					return False
+		optim.load_state_dict(state)
+		return True
 
 	def load_task_modules(self, task_modules_path, load_optim=True):
 		ck = torch.load(
@@ -309,14 +363,16 @@ class ContinualTDMPC2(nn.Module):
 		if load_optim:
 			if 'task_optim' in ck:
 				try:
-					self.task_optim.load_state_dict(ck['task_optim'])
+					self._load_optim_checked(
+						self.task_optim, ck['task_optim'], 'task_optim')
 				except Exception as e:
 					print(colored(
 						f'[warn] task_optim.load_state_dict failed ({e}).',
 						'yellow'))
 			if 'pi_optim' in ck:
 				try:
-					self.pi_optim.load_state_dict(ck['pi_optim'])
+					self._load_optim_checked(
+						self.pi_optim, ck['pi_optim'], 'pi_optim')
 				except Exception as e:
 					print(colored(
 						f'[warn] pi_optim.load_state_dict failed ({e}).',

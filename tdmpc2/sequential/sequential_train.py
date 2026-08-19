@@ -154,6 +154,115 @@ def save_wandb_run_id(base_logdir, run_id):
 
 
 # ==========================================================================
+# Mid-task resume (wall-clock survival)
+# ==========================================================================
+# Task-level resume (above) only rescues work at task boundaries. On clusters
+# with a hard wall-clock cap (e.g. Civo's 48h) a single long task can exceed
+# the limit, so a kill mid-task would otherwise discard the whole task and
+# restart it from random weights.
+#
+# The pieces below add step-level resume:
+#   * `save_midtask_checkpoint` writes agent weights + optimizer state into
+#     ONE rolling directory (`models/latest/`) plus a small JSON manifest.
+#     It is rewritten in place every `save_freq` steps, so disk use stays
+#     flat regardless of run length — nothing accumulates.
+#   * `load_midtask_checkpoint` restores it, returning the local step to
+#     resume the task's inner loop from.
+# Rollouts are NOT handled here: they are already persisted per-episode by
+# `--save-episodes` into `train_eps/` and replayed by `buffer.load_from_
+# directory`, which is what actually refills the replay buffer on resume.
+
+MIDTASK_DIRNAME = 'latest'
+
+
+def _midtask_manifest_path(task_logdir):
+    return Path(task_logdir) / 'midtask_manifest.json'
+
+
+def save_midtask_checkpoint(task_logdir, agent, local_step, ep_idx,
+                            global_step_start):
+    """Persist mid-task training state, overwriting the previous snapshot.
+
+    Writes `models/latest/{backbone,task_modules}.pt` (via the agent's own
+    save_task, so optimizer momentum survives) and an atomically-replaced
+    manifest recording the step to resume from. Only one snapshot ever
+    exists on disk.
+    """
+    task_logdir = Path(task_logdir)
+    ckpt_dir = task_logdir / 'models' / MIDTASK_DIRNAME
+    try:
+        agent.save_task(ckpt_dir)
+    except Exception as e:
+        print(colored(f'[midtask] checkpoint save failed: {e}', 'red'))
+        return False
+
+    manifest = {
+        'local_step': int(local_step),
+        'ep_idx': int(ep_idx),
+        'global_step_start': int(global_step_start),
+    }
+    path = _midtask_manifest_path(task_logdir)
+    try:
+        tmp = path.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(manifest, indent=2))
+        tmp.replace(path)          # atomic: a kill mid-write can't corrupt it
+    except Exception as e:
+        print(colored(f'[midtask] manifest save failed: {e}', 'red'))
+        return False
+    return True
+
+
+def load_midtask_checkpoint(task_logdir, agent):
+    """Restore a mid-task snapshot if one exists.
+
+    Returns `(local_step, ep_idx)` on success, or `(0, 0)` when there is
+    nothing to resume from (fresh task).
+    """
+    task_logdir = Path(task_logdir)
+    path = _midtask_manifest_path(task_logdir)
+    ckpt_dir = task_logdir / 'models' / MIDTASK_DIRNAME
+    if not path.exists() or not (ckpt_dir / 'backbone.pt').exists():
+        return 0, 0
+    try:
+        manifest = json.loads(path.read_text())
+    except Exception as e:
+        print(colored(f'[midtask] manifest unreadable ({e}); '
+                      f'starting task from scratch.', 'yellow'))
+        return 0, 0
+    try:
+        agent.load_backbone(ckpt_dir / 'backbone.pt', load_optim=True)
+        if (ckpt_dir / 'task_modules.pt').exists():
+            agent.load_task_modules(ckpt_dir / 'task_modules.pt',
+                                    load_optim=True)
+    except Exception as e:
+        print(colored(f'[midtask] checkpoint load failed ({e}); '
+                      f'starting task from scratch.', 'red'))
+        return 0, 0
+    local_step = int(manifest.get('local_step', 0))
+    ep_idx = int(manifest.get('ep_idx', 0))
+    print(colored(
+        f'>>> MID-TASK RESUME: continuing from local step {local_step:,} '
+        f'(episode {ep_idx}).', 'cyan', attrs=['bold']))
+    return local_step, ep_idx
+
+
+def clear_midtask_checkpoint(task_logdir):
+    """Remove the rolling mid-task snapshot once the task has completed.
+
+    The task's own `backbone.pt` / `task_modules.pt` (written by save_task at
+    the task boundary) supersede it, so keeping it would waste disk and could
+    confuse a later resume into re-entering a finished task.
+    """
+    task_logdir = Path(task_logdir)
+    try:
+        _midtask_manifest_path(task_logdir).unlink(missing_ok=True)
+        shutil.rmtree(task_logdir / 'models' / MIDTASK_DIRNAME,
+                      ignore_errors=True)
+    except Exception as e:
+        print(colored(f'[midtask] cleanup failed: {e}', 'yellow'))
+
+
+# ==========================================================================
 # Minimal logger that shares ONE wandb run across all tasks
 # ==========================================================================
 
@@ -359,7 +468,8 @@ def train_one_task(cfg, agent, env, buffer, logger,
                    teacher_modules=None,
                    reward_anchor_coef=0.0,
                    termination_anchor_coef=0.0,
-                   merged=False, merged_main_task_id=None, aux_sizes=None):
+                   merged=False, merged_main_task_id=None, aux_sizes=None,
+                   start_step=0, start_ep_idx=0, task_logdir=None):
     """Run TD-MPC2's online training loop for a single task.
 
     `eval_fn(agent, local_step, global_step)` runs the cross-task evaluation.
@@ -374,6 +484,12 @@ def train_one_task(cfg, agent, env, buffer, logger,
     non-empty, every main `agent.update(buffer)` is followed by one
     `agent.aux_update(aux_buffers[j], j)` for a randomly chosen j — the
     routing-aware anchored-ER step.
+    `start_step` / `start_ep_idx`: mid-task resume point (0 for a fresh
+    task). The caller restores agent weights before calling; these just
+    position the inner loop's counters so the step budget, logging and
+    global-step offsets stay consistent across a requeue.
+    `task_logdir`: where the rolling mid-task snapshot is written every
+    `cfg.save_freq` steps.
     """
     logger.global_step_fn = lambda s: global_step_start + s
     if save_episodes and episode_dir is not None:
@@ -383,13 +499,14 @@ def train_one_task(cfg, agent, env, buffer, logger,
 
     pbar = tqdm(
         total=cfg.steps,
+        initial=int(start_step),
         desc=f'T{task_idx + 1}/{num_tasks} {task_name}',
         unit='step',
         dynamic_ncols=True,
     )
 
-    local_step = 0
-    ep_idx = 0
+    local_step = int(start_step)
+    ep_idx = int(start_ep_idx)
     cur_transitions = 0        # tracks current-task buffer fill (merged mode)
     start_time = time()
     train_metrics = {}
@@ -416,14 +533,29 @@ def train_one_task(cfg, agent, env, buffer, logger,
 
             if (cfg.save_freq > 0 and local_step > 0
                     and local_step % cfg.save_freq == 0):
-                logger.save_agent(agent, identifier=local_step)
+                # Rolling mid-task snapshot: overwrites the single
+                # `models/latest/` dir rather than accumulating one .pt per
+                # save_freq interval, so disk stays flat over a long run.
+                # This is what lets a wall-clock kill resume mid-task.
+                if task_logdir is not None:
+                    save_midtask_checkpoint(
+                        task_logdir, agent, local_step, ep_idx,
+                        global_step_start)
 
             if done:
                 if eval_next:
                     eval_fn(agent, local_step, global_step_start + local_step)
                     eval_next = False
 
-                if local_step > 0:
+                # `info` is the "an episode is in flight" flag: it is only ever
+                # set by env.step() below, so it is None on the first iteration
+                # of a fresh start AND of a RESUMED run. `local_step > 0` alone
+                # was a valid proxy only while runs always began at step 0 —
+                # with mid-task resume local_step starts at e.g. 300000 while
+                # no episode has been collected yet, so the old guard fell
+                # through and dereferenced None. (Upstream OnlineTrainer.train
+                # guards on `info` for exactly this reason.)
+                if info is not None:
                     if info['terminated'] and not cfg.episodic:
                         raise ValueError(
                             'Termination detected but cfg.episodic=false. '
@@ -821,6 +953,11 @@ def run_continual_sequential(args, *, progressive,
         # The frozen backbone persists across all tasks; only the pooling/
         # projection/fusion train. dino_* knobs come from config.yaml.
         encoder_type=getattr(args, 'encoder_type', 'default'),
+        # DINO knobs that are worth sweeping from the launcher. Each falls
+        # back to the config.yaml default when the flag is absent.
+        dino_weights=getattr(args, 'dino_weights', None),
+        dino_head_hidden=getattr(args, 'dino_head_hidden', None),
+        dino_per_task_projector=getattr(args, 'dino_per_task_projector', None),
         # SDP-faithful (Plan A) freeze: after task 0 ContinualTDMPC2 freezes
         # the shared MoE head + gate τ-column + τ schedule (old experts already
         # progressively frozen; per-task heads already isolated). Prevents
@@ -1129,6 +1266,15 @@ def run_continual_sequential(args, *, progressive,
                             f'>>> Pruned {dropped} stale episode files.',
                             'yellow'))
 
+        # ---- Mid-task resume ---------------------------------------------
+        # If a previous submission was killed by the wall clock partway
+        # through THIS task, restore its agent weights + optimizer state and
+        # pick the inner loop up at the recorded step. The replay buffer has
+        # already been refilled from train_eps/ just above, so training
+        # continues against comparable data. No-ops on a fresh task.
+        task_start_step, task_start_ep_idx = load_midtask_checkpoint(
+            task_logdir, agent)
+
         # ---- Build per-prior-task aux buffers (anchored ER, never FIFO'd).
         # Replaces the older "load ER into the main buffer" prefill — that
         # leaked ER episodes via FIFO eviction once the main buffer filled
@@ -1325,6 +1471,9 @@ def run_continual_sequential(args, *, progressive,
             merged=merged,
             merged_main_task_id=task_idx,
             aux_sizes=aux_sizes,
+            start_step=task_start_step,
+            start_ep_idx=task_start_ep_idx,
+            task_logdir=task_logdir,
         )
 
         # ---- Final cross-task eval + save ------------------------------
@@ -1348,6 +1497,10 @@ def run_continual_sequential(args, *, progressive,
             base_logdir, task_idx, task_name=task_name,
             completed=True, global_step_at_end=global_step,
         )
+        # The task-boundary checkpoint just written supersedes the rolling
+        # mid-task snapshot; drop it so it neither wastes disk nor tempts a
+        # later resume back into a finished task.
+        clear_midtask_checkpoint(task_logdir)
 
         # ---- Transition: prepare agent for task t+1 --------------------
         if task_idx + 1 < num_tasks:
@@ -1519,5 +1672,23 @@ if __name__ == '__main__':
                    choices=['default', 'dino'],
                    help="rgb encoder: 'default' CNN or frozen 'dino' "
                         '(DINOv2 + trainable head; forces compile=false).')
+    p.add_argument('--dino-weights', type=str, default=None,
+                   help='Path to the DINOv2 .safetensors checkpoint. Defaults '
+                        'to config.yaml (which points inside the repo); on a '
+                        'quota-limited home, point this at scratch instead.')
+    p.add_argument('--dino-head-hidden', type=int, default=None,
+                   help='Hidden width of the rgb projector MLP. 0 = the '
+                        'original single Linear head. Default from config.yaml.')
+    p.add_argument('--dino-per-task-projector', dest='dino_per_task_projector',
+                   action='store_true',
+                   help='Give each task its own rgb projector, frozen at the '
+                        'task boundary with that task\'s experts (prevents '
+                        'representation drift into frozen experts).')
+    p.add_argument('--no-dino-per-task-projector',
+                   dest='dino_per_task_projector', action='store_false',
+                   help='Use ONE shared projector for all tasks (pre-fix '
+                        'behaviour; the frozen experts then see a drifting '
+                        'input distribution).')
+    p.set_defaults(dino_per_task_projector=None)   # None -> config.yaml default
 
     main(p.parse_args())

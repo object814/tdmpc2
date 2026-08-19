@@ -207,5 +207,22 @@ if __name__ == '__main__':
                    choices=['default', 'dino'],
                    help="rgb encoder: 'default' CNN or frozen 'dino' "
                         '(DINOv2 + trainable head; forces compile=false).')
+    p.add_argument('--dino-weights', type=str, default=None,
+                   help='Path to the DINOv2 .safetensors checkpoint. Defaults '
+                        'to config.yaml (which points inside the repo); on a '
+                        'quota-limited home, point this at scratch instead.')
+    p.add_argument('--dino-head-hidden', type=int, default=None,
+                   help='Hidden width of the rgb projector MLP. 0 = the '
+                        'original single Linear head. Default from config.yaml.')
+    p.add_argument('--dino-per-task-projector', dest='dino_per_task_projector',
+                   action='store_true',
+                   help='Give each task its own rgb projector, frozen at the '
+                        'task boundary with that task\'s experts (prevents '
+                        'representation drift into frozen experts).')
+    p.add_argument('--no-dino-per-task-projector',
+                   dest='dino_per_task_projector', action='store_false',
+                   help='Use ONE shared projector for all tasks (pre-fix '
+                        'behaviour).')
+    p.set_defaults(dino_per_task_projector=None)
 
     main(p.parse_args())

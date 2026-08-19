@@ -92,6 +92,35 @@ class PrismBackbone(nn.Module):
 		# Encoder — same multi-modal stack as common.world_model.WorldModel.
 		self._encoder = layers.enc(cfg)
 
+		# Per-task rgb projectors ------------------------------------------
+		# With encoder_type=dino + dino_per_task_projector, the rgb branch
+		# stops at pooled ViT features and the projection into encoder space
+		# lives HERE, one module per task. Task t's projector is frozen at the
+		# task boundary along with task t's experts, so the frozen experts of
+		# earlier tasks keep seeing the exact input distribution they were
+		# trained on. A single shared projector (the previous behaviour) keeps
+		# training during later tasks and silently drifts that distribution —
+		# freezing the DINO backbone does not help, because the drift is in
+		# the trainable projector downstream of it.
+		#
+		# Pre-allocated for all `num_tasks` up front so the checkpoint shape is
+		# constant across the whole CL run, matching the `total_K` experts
+		# convention (load_backbone stays bit-exact, no shape negotiation).
+		self._projectors = None
+		# NB: nn.ModuleDict has no `.get()` — membership must be tested with
+		# `in`, otherwise this silently skips and encode() returns raw pooled
+		# features instead of a latent.
+		rgb_branch = self._encoder['rgb'] if 'rgb' in self._encoder else None
+		if rgb_branch is not None and getattr(rgb_branch, 'externalize_projector', False):
+			multimodal = ('state' in cfg.obs_shape and 'rgb' in cfg.obs_shape)
+			proj_out = cfg.enc_dim if multimodal else cfg.latent_dim
+			proj_act = None if multimodal else layers.SimNorm(cfg)
+			self._projectors = nn.ModuleList([
+				layers.dino_projector(
+					rgb_branch.feature_dim, proj_out, cfg, act=proj_act)
+				for _ in range(self.num_tasks)
+			])
+
 		# Dynamics MoE — gate sees one-hot, experts see [z, a, one-hot].
 		dyn_in = cfg.latent_dim + cfg.action_dim + self.num_tasks
 		gate_dim = self.num_tasks
@@ -148,6 +177,35 @@ class PrismBackbone(nn.Module):
 
 	def current_task(self):
 		return self._current_task_idx
+
+	# ------------------------------------------------------------------
+	# Per-task projectors
+	# ------------------------------------------------------------------
+	def freeze_projectors_through(self, t):
+		"""Freeze per-task projectors `[0, t)`; leave `[t, num_tasks)` trainable.
+
+		The mirror of `MaskedMoEBlock.freeze_experts_through`, called from the
+		same task-boundary transition so a task's projector and its experts are
+		always frozen together. No-op unless per-task projectors are enabled.
+		"""
+		if self._projectors is None:
+			return
+		t = int(t)
+		for i, proj in enumerate(self._projectors):
+			trainable = i >= t
+			for p in proj.parameters():
+				p.requires_grad = trainable
+
+	def _project_rgb(self, feat):
+		"""Apply the CURRENT task's projector to pooled rgb features.
+
+		Routing is by task index, not by the MoE gate: the projector is not a
+		routed component, so each task simply selects its own module. Under
+		`scoped(task_idx=j)` this automatically picks task j's projector, which
+		is what makes cross-task evaluation see the representation task j was
+		actually trained against.
+		"""
+		return self._projectors[self._current_task_idx](feat)
 
 	def _task_one_hot_for(self, z):
 		leading = z.shape[:-1]
@@ -225,6 +283,8 @@ class PrismBackbone(nn.Module):
 		  - Plain Tensor obs (`cfg.obs` resolves the encoder branch)
 		  - (T, B, ...) leading time-batch dim on rgb observations
 		"""
+		# `_encode_rgb` folds in the per-task projector when one is configured;
+		# otherwise it is exactly `self._encoder['rgb']`.
 		if not isinstance(obs, torch.Tensor) and hasattr(obs, 'keys'):
 			if 'fusion' in self._encoder:
 				state = obs['state']
@@ -234,23 +294,40 @@ class PrismBackbone(nn.Module):
 					outs = []
 					for t in range(T):
 						s_feat = self._encoder['state'](state[t])
-						r_feat = self._encoder['rgb'](rgb[t])
+						r_feat = self._encode_rgb(rgb[t])
 						outs.append(self._encoder['fusion'](
 							torch.cat([s_feat, r_feat], dim=-1)))
 					return torch.stack(outs)
 				s_feat = self._encoder['state'](state)
-				r_feat = self._encoder['rgb'](rgb)
+				r_feat = self._encode_rgb(rgb)
 				return self._encoder['fusion'](
 					torch.cat([s_feat, r_feat], dim=-1))
 			k = next(iter(obs.keys()))
 			v = obs[k]
-			if k == 'rgb' and v.ndim == 5:
-				return torch.stack([self._encoder[k](o) for o in v])
+			if k == 'rgb':
+				if v.ndim == 5:
+					return torch.stack([self._encode_rgb(o) for o in v])
+				return self._encode_rgb(v)
 			return self._encoder[k](v)
 
-		if self.cfg.obs == 'rgb' and obs.ndim == 5:
-			return torch.stack([self._encoder[self.cfg.obs](o) for o in obs])
+		if self.cfg.obs == 'rgb':
+			if obs.ndim == 5:
+				return torch.stack([self._encode_rgb(o) for o in obs])
+			return self._encode_rgb(obs)
 		return self._encoder[self.cfg.obs](obs)
+
+	def _encode_rgb(self, rgb):
+		"""rgb branch + (optional) current-task projector."""
+		feat = self._encoder['rgb'](rgb)
+		if self._projectors is None:
+			# Fail loudly rather than silently returning unprojected features:
+			# if the branch externalized its head, a projector MUST exist.
+			assert not getattr(self._encoder['rgb'], 'externalize_projector', False), (
+				'rgb branch externalized its projector but PrismBackbone built '
+				'no projector bank — encode() would return raw pooled features.'
+			)
+			return feat
+		return self._project_rgb(feat)
 
 	def next(self, z, a, task_ids=None):
 		"""z_{t+1} = MoE_dyn(z, a, task_one_hot).
