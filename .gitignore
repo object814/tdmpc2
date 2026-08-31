@@ -135,3 +135,4 @@ training/
 pretrain_data/
 # Retired scripts kept locally for reference
 archive/
+results/
