@@ -1,0 +1,4 @@
+# Generated analysis output: figures, metrics.json, run logs, and the local
+# wandb run directories. All of it is reproducible with `analyze.py`, and the
+# wandb subdirectory alone runs to tens of MB.
+results/
